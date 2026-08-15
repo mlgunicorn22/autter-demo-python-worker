@@ -9,6 +9,26 @@ from worker.store import jobs, submit_job, next_job
 from worker.processor import build_prompt, read_upload
 
 def setup_function(): jobs.clear()
+
+def submit_concurrently_with_same_key(initial_status, *, retry=False):
+    barrier = threading.Barrier(12)
+
+    def submit_once(_):
+        barrier.wait()
+        return submit_job("org_a", "llm", {"text": "first"}, "k1", retry=retry)
+
+    first = submit_job("org_a", "llm", {"text": "first"}, "k1")
+    first.status = initial_status
+    if initial_status == "failed":
+        first.error = "worker failed"
+        first.visible_at = 0
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(pool.map(submit_once, range(12)))
+
+    return results, first
+
+
 def test_submit_job(): assert submit_job("org_a","llm",{"text":"hi"}).status == "queued"
 def test_idempotency_key_reuses_job():
     a = submit_job("org_a", "llm", {"text": "first"}, "k1")
@@ -49,13 +69,16 @@ def test_create_job_conflict_for_reused_key_different_kind():
     assert "different request" in second.json()["detail"]
 
 
-def test_failed_job_retries_with_same_idempotency_key():
+def test_failed_job_requires_explicit_retry_with_same_idempotency_key():
     a = submit_job("org_a", "llm", {"text": "first"}, "k1")
     a.status = "failed"
     a.error = "worker failed"
     a.visible_at = 0
 
-    b = submit_job("org_a", "llm", {"text": "first"}, "k1")
+    with pytest.raises(ValueError):
+        submit_job("org_a", "llm", {"text": "first"}, "k1")
+
+    b = submit_job("org_a", "llm", {"text": "first"}, "k1", retry=True)
 
     assert b.id == a.id
     assert b.status == "queued"
@@ -65,7 +88,7 @@ def test_failed_job_retries_with_same_idempotency_key():
     assert b.idempotency_key == "k1"
 
 
-def test_queued_job_retries_with_same_idempotency_key():
+def test_queued_job_reuses_same_idempotency_key_without_creating_new_job():
     a = submit_job("org_a", "llm", {"text": "hi"}, "k1")
     b = submit_job("org_a", "llm", {"text": "hi"}, "k1")
     assert b.id == a.id
@@ -75,17 +98,7 @@ def test_queued_job_retries_with_same_idempotency_key():
 
 
 def test_concurrent_submissions_with_same_key_create_one_job_when_completed():
-    barrier = threading.Barrier(12)
-
-    def submit_once(_):
-        barrier.wait()
-        return submit_job("org_a", "llm", {"text": "first"}, "k1")
-
-    first = submit_job("org_a", "llm", {"text": "first"}, "k1")
-    first.status = "complete"
-
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        results = list(pool.map(submit_once, range(12)))
+    results, first = submit_concurrently_with_same_key("complete")
 
     assert len({job.id for job in results}) == 1
     assert {job.id for job in results} == {first.id}
@@ -93,19 +106,7 @@ def test_concurrent_submissions_with_same_key_create_one_job_when_completed():
 
 
 def test_concurrent_failed_retries_create_one_job():
-    barrier = threading.Barrier(12)
-
-    def submit_once(_):
-        barrier.wait()
-        return submit_job("org_a", "llm", {"text": "first"}, "k1")
-
-    first = submit_job("org_a", "llm", {"text": "first"}, "k1")
-    first.status = "failed"
-    first.error = "worker failed"
-    first.visible_at = 0
-
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        results = list(pool.map(submit_once, range(12)))
+    results, first = submit_concurrently_with_same_key("failed", retry=True)
 
     assert len({job.id for job in results}) == 1
     assert {job.id for job in results} == {first.id}
