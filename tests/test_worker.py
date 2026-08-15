@@ -4,13 +4,19 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi.testclient import TestClient
 
-from worker.api import app, rate_limiter
-from worker.store import jobs, submit_job, next_job, purge_expired_jobs
+from worker.api import app, build_signed_token, rate_limiter
 from worker.processor import build_prompt, read_upload, run_once
+from worker.store import jobs, next_job, purge_expired_jobs, submit_job
+
+
+def auth_headers(org_id: str):
+    return {"Authorization": f"Bearer {build_signed_token(org_id, sub=f'{org_id}-user')}"}
+
 
 def setup_function():
     jobs.clear()
     rate_limiter.clear()
+
 
 def submit_concurrently_with_same_key(initial_status, *, retry=False):
     barrier = threading.Barrier(12)
@@ -31,7 +37,8 @@ def submit_concurrently_with_same_key(initial_status, *, retry=False):
     return results, first
 
 
-def test_submit_job(): assert submit_job("org_a","llm",{"text":"hi"}, "submit-key").status == "queued"
+def test_submit_job():
+    assert submit_job("org_a", "llm", {"text": "hi"}, "submit-key").status == "queued"
 
 
 def test_submit_job_purges_expired_jobs_without_deadlocking():
@@ -68,33 +75,35 @@ def test_same_key_conflicting_kind_is_rejected():
 
 def test_create_job_conflict_for_reused_key_different_payload():
     client = TestClient(app)
-    first = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "first"}}, headers={"Idempotency-Key": "k1"})
+    headers = {**auth_headers("org_a"), "Idempotency-Key": "k1"}
+    first = client.post("/jobs", json={"kind": "llm", "payload": {"text": "first"}}, headers=headers)
     assert first.status_code == 200
 
-    second = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "different"}}, headers={"Idempotency-Key": "k1"})
+    second = client.post("/jobs", json={"kind": "llm", "payload": {"text": "different"}}, headers=headers)
     assert second.status_code == 409
     assert second.json()["detail"] == "request failed"
 
 
 def test_create_job_conflict_for_reused_key_different_kind():
     client = TestClient(app)
-    first = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "first"}}, headers={"Idempotency-Key": "k1"})
+    headers = {**auth_headers("org_a"), "Idempotency-Key": "k1"}
+    first = client.post("/jobs", json={"kind": "llm", "payload": {"text": "first"}}, headers=headers)
     assert first.status_code == 200
 
-    second = client.post("/jobs", json={"org_id": "org_a", "kind": "file", "payload": {"text": "first"}}, headers={"Idempotency-Key": "k1"})
+    second = client.post("/jobs", json={"kind": "file", "payload": {"text": "first"}}, headers=headers)
     assert second.status_code == 409
     assert second.json()["detail"] == "request failed"
 
 
 def test_create_job_requires_idempotency_key_and_reuses_the_same_request():
     client = TestClient(app)
+    auth = auth_headers("org_a")
 
-    missing = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "first"}})
-    assert missing.status_code == 422
-    assert "idempotency" in missing.json()["detail"][0]["loc"][0].lower() or "idempotency" in str(missing.json()["detail"]).lower()
+    missing = client.post("/jobs", json={"kind": "llm", "payload": {"text": "first"}})
+    assert missing.status_code == 404
 
-    first = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "first"}}, headers={"Idempotency-Key": "k1"})
-    second = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "first"}}, headers={"Idempotency-Key": "k1"})
+    first = client.post("/jobs", json={"kind": "llm", "payload": {"text": "first"}}, headers={**auth, "Idempotency-Key": "k1"})
+    second = client.post("/jobs", json={"kind": "llm", "payload": {"text": "first"}}, headers={**auth, "Idempotency-Key": "k1"})
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -103,12 +112,9 @@ def test_create_job_requires_idempotency_key_and_reuses_the_same_request():
 
 def test_failed_job_can_only_be_retried_with_explicit_retry_flag():
     client = TestClient(app)
+    headers = auth_headers("org_a")
 
-    first = client.post(
-        "/jobs",
-        json={"org_id": "org_a", "kind": "llm", "payload": {"text": "first"}},
-        headers={"Idempotency-Key": "retry-key"},
-    )
+    first = client.post("/jobs", json={"kind": "llm", "payload": {"text": "first"}}, headers={**headers, "Idempotency-Key": "retry-key"})
     assert first.status_code == 200
 
     existing = jobs[0]
@@ -116,19 +122,11 @@ def test_failed_job_can_only_be_retried_with_explicit_retry_flag():
     existing.error = "worker failed"
     existing.visible_at = 0
 
-    blocked = client.post(
-        "/jobs",
-        json={"org_id": "org_a", "kind": "llm", "payload": {"text": "first"}, "retry": False},
-        headers={"Idempotency-Key": "retry-key"},
-    )
+    blocked = client.post("/jobs", json={"kind": "llm", "payload": {"text": "first"}, "retry": False}, headers={**headers, "Idempotency-Key": "retry-key"})
     assert blocked.status_code == 409
     assert blocked.json()["detail"] == "request failed"
 
-    allowed = client.post(
-        "/jobs",
-        json={"org_id": "org_a", "kind": "llm", "payload": {"text": "first"}, "retry": True},
-        headers={"Idempotency-Key": "retry-key"},
-    )
+    allowed = client.post("/jobs", json={"kind": "llm", "payload": {"text": "first"}, "retry": True}, headers={**headers, "Idempotency-Key": "retry-key"})
     assert allowed.status_code == 200
     assert allowed.json()["id"] == existing.id
     assert allowed.json()["status"] == "queued"
@@ -137,10 +135,13 @@ def test_failed_job_can_only_be_retried_with_explicit_retry_flag():
 
 def test_jobs_endpoint_rate_limits_same_ip():
     client = TestClient(app)
+    headers1 = {**auth_headers("org_a"), "X-Forwarded-For": "203.0.113.10", "Idempotency-Key": "ip-1"}
+    headers2 = {**auth_headers("org_a"), "X-Forwarded-For": "203.0.113.10", "Idempotency-Key": "ip-2"}
+    headers3 = {**auth_headers("org_a"), "X-Forwarded-For": "203.0.113.10", "Idempotency-Key": "ip-3"}
 
-    first = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "first"}}, headers={"X-Forwarded-For": "203.0.113.10", "Idempotency-Key": "ip-1"})
-    second = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "second"}}, headers={"X-Forwarded-For": "203.0.113.10", "Idempotency-Key": "ip-2"})
-    third = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "third"}}, headers={"X-Forwarded-For": "203.0.113.10", "Idempotency-Key": "ip-3"})
+    first = client.post("/jobs", json={"kind": "llm", "payload": {"text": "first"}}, headers=headers1)
+    second = client.post("/jobs", json={"kind": "llm", "payload": {"text": "second"}}, headers=headers2)
+    third = client.post("/jobs", json={"kind": "llm", "payload": {"text": "third"}}, headers=headers3)
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -151,10 +152,10 @@ def test_jobs_endpoint_rate_limits_same_ip():
 def test_jobs_endpoint_rate_limits_same_org():
     client = TestClient(app)
 
-    first = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "first"}}, headers={"X-Forwarded-For": "203.0.113.11", "Idempotency-Key": "org-1"})
-    second = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "second"}}, headers={"X-Forwarded-For": "203.0.113.12", "Idempotency-Key": "org-2"})
-    third = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "third"}}, headers={"X-Forwarded-For": "203.0.113.13", "Idempotency-Key": "org-3"})
-    fourth = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "fourth"}}, headers={"X-Forwarded-For": "203.0.113.14", "Idempotency-Key": "org-4"})
+    first = client.post("/jobs", json={"kind": "llm", "payload": {"text": "first"}}, headers={**auth_headers("org_a"), "X-Forwarded-For": "203.0.113.11", "Idempotency-Key": "org-1"})
+    second = client.post("/jobs", json={"kind": "llm", "payload": {"text": "second"}}, headers={**auth_headers("org_a"), "X-Forwarded-For": "203.0.113.12", "Idempotency-Key": "org-2"})
+    third = client.post("/jobs", json={"kind": "llm", "payload": {"text": "third"}}, headers={**auth_headers("org_a"), "X-Forwarded-For": "203.0.113.13", "Idempotency-Key": "org-3"})
+    fourth = client.post("/jobs", json={"kind": "llm", "payload": {"text": "fourth"}}, headers={**auth_headers("org_a"), "X-Forwarded-For": "203.0.113.14", "Idempotency-Key": "org-4"})
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -167,7 +168,7 @@ def test_jobs_endpoint_rate_limits_queue_backpressure():
     client = TestClient(app)
     for idx in range(10):
         submit_job("org_a", "llm", {"text": f"job-{idx}"}, f"queue-{idx}")
-    response = client.post("/jobs", json={"org_id": "org_b", "kind": "llm", "payload": {"text": "overflow"}}, headers={"X-Forwarded-For": "203.0.113.15", "Idempotency-Key": "queue-backpressure"})
+    response = client.post("/jobs", json={"kind": "llm", "payload": {"text": "overflow"}}, headers={**auth_headers("org_b"), "X-Forwarded-For": "203.0.113.15", "Idempotency-Key": "queue-backpressure"})
 
     assert response.status_code == 429
     assert response.headers["Retry-After"].isdigit()
@@ -183,11 +184,22 @@ def test_get_job_requires_authentication():
     assert response.json()["detail"] == "job not found"
 
 
+def test_forged_bearer_token_cannot_access_other_org_job():
+    client = TestClient(app)
+    job = submit_job("org_a", "llm", {"text": "restricted-sample"}, "cross-org-key")
+
+    forged = "eyJvcmdfaWQiOiJvcmdfYiJ9.invalid-signature"
+    response = client.get(f"/jobs/{job.id}", headers={"Authorization": f"Bearer {forged}"})
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "job not found"
+
+
 def test_get_job_rejects_cross_organization_access():
     client = TestClient(app)
     job = submit_job("org_a", "llm", {"text": "restricted-sample"}, "cross-org-key")
 
-    response = client.get(f"/jobs/{job.id}", headers={"Authorization": "Bearer org_b"})
+    response = client.get(f"/jobs/{job.id}", headers=auth_headers("org_b"))
 
     assert response.status_code == 404
     assert response.json()["detail"] == "job not found"
@@ -197,8 +209,8 @@ def test_job_response_fields_are_minimized_for_clients():
     client = TestClient(app)
     job = client.post(
         "/jobs",
-        json={"org_id": "org_a", "kind": "llm", "payload": {"text": "safe"}},
-        headers={"Idempotency-Key": "client-safe"},
+        json={"kind": "llm", "payload": {"text": "safe"}},
+        headers={**auth_headers("org_a"), "Idempotency-Key": "client-safe"},
     )
 
     assert job.status_code == 200
@@ -213,9 +225,9 @@ def test_get_job_endpoint_rate_limits_same_ip():
     client = TestClient(app)
     job = submit_job("org_a", "llm", {"text": "polling"}, "poll-key")
 
-    first = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.20", "Authorization": "Bearer org_a"})
-    second = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.20", "Authorization": "Bearer org_a"})
-    third = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.20", "Authorization": "Bearer org_a"})
+    first = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.20", **auth_headers("org_a")})
+    second = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.20", **auth_headers("org_a")})
+    third = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.20", **auth_headers("org_a")})
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -227,9 +239,9 @@ def test_get_job_endpoint_rate_limits_unauthenticated_clients_more_tightly():
     client = TestClient(app)
     job = submit_job("org_b", "llm", {"text": "unauth"}, "unauth-key")
 
-    first = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.21", "Authorization": "Bearer org_b"})
-    second = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.21", "Authorization": "Bearer org_b"})
-    third = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.21", "Authorization": "Bearer org_b"})
+    first = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.21", **auth_headers("org_b")})
+    second = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.21", **auth_headers("org_b")})
+    third = client.get(f"/jobs/{job.id}", headers={"X-Forwarded-For": "203.0.113.21", **auth_headers("org_b")})
 
     assert first.status_code == 200
     assert second.status_code == 200

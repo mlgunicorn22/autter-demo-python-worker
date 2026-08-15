@@ -1,12 +1,26 @@
-from dataclasses import dataclass, field
-import threading, time, uuid
+from dataclasses import dataclass
+import threading
+import time
+import uuid
 
 PAYLOAD_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
+
 @dataclass
 class Job:
-    id:str; org_id:str; kind:str; payload:dict; status:str="queued"; attempts:int=0; error:str|None=None; visible_at:float=0; idempotency_key:str|None=None; expires_at:float|None=None
-jobs:list[Job]=[]
+    id: str
+    org_id: str
+    kind: str
+    payload: dict
+    status: str = "queued"
+    attempts: int = 0
+    error: str | None = None
+    visible_at: float = 0
+    idempotency_key: str | None = None
+    expires_at: float | None = None
+
+
+jobs: list[Job] = []
 _submit_lock = threading.Lock()
 
 
@@ -80,12 +94,14 @@ def submit_job(org_id, kind, payload, idempotency_key=None, *, retry=False):
 
 
 def next_job(org_id):
-    now=time.time()
+    now = time.time()
     with _submit_lock:
         _purge_expired_jobs_locked(now)
         for job in jobs:
             if job.org_id != org_id:
                 continue
-            if job.status in ("queued","processing") and job.visible_at <= now:
-                job.status="processing"; job.visible_at=now+1; return job
+            if job.status in ("queued", "processing") and job.visible_at <= now:
+                job.status = "processing"
+                job.visible_at = now + 1
+                return job
         return None
