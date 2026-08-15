@@ -1,10 +1,27 @@
+import logging
 import time
+import logging
+import time
+import uuid
 from collections import defaultdict, deque
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from .store import submit_job, jobs, purge_expired_jobs
+
+logger = logging.getLogger(__name__)
+
+PUBLIC_JOB_FIELDS = {"id", "org_id", "kind", "status"}
+
+
+def serialize_public_job(job):
+    return {key: getattr(job, key) for key in PUBLIC_JOB_FIELDS if hasattr(job, key)}
+
+
+def _safe_error_detail(message: str, *, correlation_id: str):
+    logger.warning("%s: %s", correlation_id, message)
+    return {"detail": "request failed"}
 
 
 class InMemoryRateLimiter:
@@ -85,11 +102,11 @@ def create_job(body:JobIn, request: Request, idempotency_key:str=Header(..., min
         raise HTTPException(status_code=400, detail="Idempotency key is required")
     try:
         job = submit_job(body.org_id, body.kind, body.payload, normalized_key, retry=body.retry)
-        return JobResponse.model_validate(job)
+        return JobResponse.model_validate(serialize_public_job(job))
     except ValueError as exc:
-        # Keep the detailed context for server-side diagnostics only; do not expose
-        # org IDs, idempotency keys, or request fingerprints in HTTP responses.
-        raise HTTPException(status_code=409, detail="idempotency conflict") from exc
+        correlation_id = str(uuid.uuid4())
+        logger.exception("job creation failed [%s]", correlation_id)
+        raise HTTPException(status_code=409, detail=_safe_error_detail("idempotency conflict", correlation_id=correlation_id)["detail"]) from exc
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id:str, request: Request):
@@ -110,4 +127,4 @@ def get_job(job_id:str, request: Request):
     job = next((j for j in jobs if j.id == job_id), None)
     if job is None or job.expires_at is not None and job.expires_at <= time.time() or job.org_id != caller_org:
         raise HTTPException(status_code=404, detail="job not found")
-    return JobResponse.model_validate(job)
+    return JobResponse.model_validate(serialize_public_job(job))

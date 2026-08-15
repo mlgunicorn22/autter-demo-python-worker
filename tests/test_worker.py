@@ -32,6 +32,21 @@ def submit_concurrently_with_same_key(initial_status, *, retry=False):
 
 
 def test_submit_job(): assert submit_job("org_a","llm",{"text":"hi"}, "submit-key").status == "queued"
+
+
+def test_submit_job_purges_expired_jobs_without_deadlocking():
+    expired = submit_job("org_a", "llm", {"text": "expired"}, "expired-key")
+    expired.expires_at = 0
+
+    fresh = submit_job("org_a", "llm", {"text": "fresh"}, "fresh-key")
+    claimed = next_job("org_a")
+
+    assert expired.id not in [job.id for job in jobs]
+    assert claimed is not None
+    assert claimed.id == fresh.id
+    assert claimed.status == "processing"
+
+
 def test_idempotency_key_reuses_job():
     a = submit_job("org_a", "llm", {"text": "first"}, "k1")
     a.status = "complete"
@@ -58,7 +73,7 @@ def test_create_job_conflict_for_reused_key_different_payload():
 
     second = client.post("/jobs", json={"org_id": "org_a", "kind": "llm", "payload": {"text": "different"}}, headers={"Idempotency-Key": "k1"})
     assert second.status_code == 409
-    assert second.json()["detail"] == "idempotency conflict"
+    assert second.json()["detail"] == "request failed"
 
 
 def test_create_job_conflict_for_reused_key_different_kind():
@@ -68,7 +83,7 @@ def test_create_job_conflict_for_reused_key_different_kind():
 
     second = client.post("/jobs", json={"org_id": "org_a", "kind": "file", "payload": {"text": "first"}}, headers={"Idempotency-Key": "k1"})
     assert second.status_code == 409
-    assert second.json()["detail"] == "idempotency conflict"
+    assert second.json()["detail"] == "request failed"
 
 
 def test_create_job_requires_idempotency_key_and_reuses_the_same_request():
@@ -107,7 +122,7 @@ def test_failed_job_can_only_be_retried_with_explicit_retry_flag():
         headers={"Idempotency-Key": "retry-key"},
     )
     assert blocked.status_code == 409
-    assert blocked.json()["detail"] == "idempotency conflict"
+    assert blocked.json()["detail"] == "request failed"
 
     allowed = client.post(
         "/jobs",
@@ -170,7 +185,7 @@ def test_get_job_requires_authentication():
 
 def test_get_job_rejects_cross_organization_access():
     client = TestClient(app)
-    job = submit_job("org_a", "llm", {"text": "secret"}, "cross-org-key")
+    job = submit_job("org_a", "llm", {"text": "restricted-sample"}, "cross-org-key")
 
     response = client.get(f"/jobs/{job.id}", headers={"Authorization": "Bearer org_b"})
 
@@ -306,7 +321,7 @@ def test_read_upload_rejects_parent_traversal():
 
 def test_read_upload_rejects_absolute_paths():
     with pytest.raises(ValueError):
-        read_upload("/tmp/secret.txt")
+        read_upload("/tmp/sample.txt")
 
 
 @pytest.mark.xfail(reason="planted sandbox bug")
